@@ -1,0 +1,725 @@
+---
+title: "Modelling the Measles Outbreak of 1861 in Hagelloch"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+
+Data were collected from a Measles outbreak in an isolated German village, Hagelloch, in 1861. Available in the surveillance R package. Data on the 188 cases in the measles outbreak among children were originally collected by Dr. Albert Pfeilsticker at the time of the outbreak and published in a paper in 1863. The dataset was augmented and re-analysed by Dr. Heike Oesterle (1992).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(deSolve)
+library(surveillance)
+library(patchwork)
+library(EpiEstim)
+library(glue)
+library(gt)
+library(gganimate)
+```
+
+```{r functions, include = FALSE}
+# descriptions of variables
+fn_load_descriptions <- function() {
+
+  # variable descriptors
+    colinfo <- tribble(~Variable, ~description,
+    'PN', 'patient number',
+    'NAME', 'patient name ',
+    'FN', 'family index',
+    'HN', 'house number',
+    'AGE', 'age in years',
+    'SEX', 'gender',
+    'PRO', 'Date of prodromes',
+    'ERU', 'Date of rash',
+    'CL', 'school class',
+    'DEAD', 'Date of death (with missings)',
+    'IFTO', 'patient no infection source',
+    'C', 'complications',
+    'PR', 'duration in days between Symptom onset and Rash',
+    'CA', 'cases in family',
+    'NI', 'initial cases',
+    'GE', 'generation number of case',
+    'TD', 'day of max. fever',
+    'TM', 'max. fever (Celsius)',
+    'x.loc', 'x coord (in meters)',
+    'y.loc', 'y coord (in meters)',
+    'tPRO', 'first symptoms days post (30 Oct 1861)',
+    'tERU', 'Day rash first appears',
+    'tDEAD', 'Day of death',
+    'tR', 'Day infectious ends',
+    'tI', 'Day infectious starts',
+    'tINFECTING_PRO', 'Prodromes of infecting patient (calculated)',
+    'days_infected', 'Number of days infected (calculated)',
+    'SI','Serial Interval (calculated)')
+    
+    return(colinfo)
+}
+
+# Calculate SEIR dataset from supplied data and date range
+fn_calc_SEIR <- function(df_data, df_dates, S0) {
+    df_I <- df_data %>% 
+        # make a sequence of all the days a person was in I 
+        mutate(seq = map2(round(tPRO), round(tR), seq)) %>%
+        pull(seq) %>%
+        unlist() %>% 
+        # convert the list back to a tibble
+        as_tibble() %>% 
+        setNames(c('day')) %>% 
+        # count the number of cases for each day
+        count(day, name='I') %>%
+        identity()
+
+    df_E <- df_data %>% 
+        # make a sequence of all the days a person was in I 
+        mutate(seq = map2(round(tPRO)-10, round(tPRO) - 1, seq)) %>%
+        pull(seq) %>%
+        unlist() %>% 
+        # convert the list back to a tibble
+        as_tibble() %>% 
+        setNames(c('day')) %>% 
+        # count the number of cases for each day
+        count(day, name='E') %>%
+        identity()
+
+    df_R <- df_data %>% 
+        mutate(seq = map2(round(tR)+1, nrow(df_dates), seq)) %>%
+        pull(seq) %>%
+        unlist() %>% 
+        # convert the list back to a tibble
+        as_tibble() %>% 
+        setNames(c('day')) %>% 
+        # count the number of cases for each day
+        count(day, name='R') %>%
+        identity()
+
+    df_SEIR <- df_dates %>% 
+        left_join(df_E, by = 'day') %>% 
+        left_join(df_I, by = 'day') %>% 
+        left_join(df_R, by = 'day') %>% 
+        replace(is.na(.), 0) %>% 
+        mutate(S = S0-E-I-R) %>% 
+        mutate(tot = S+E+I+R) %>% 
+        identity()
+
+    return(df_SEIR)
+}
+
+# plot an SEIR dataset
+fn_plot_SEIR <- function(df, desc) {
+
+    # df is a tibble with day, S, E, I, R variables
+    p <- df %>% 
+        select(day, S, E, I, R) %>% 
+        pivot_longer(
+            cols = -day,
+            names_to = 'compartment',
+            values_to = 'value') %>% 
+        mutate(compartment = factor(compartment, levels=c('S','E','I','R'))) %>% 
+        ggplot(aes(day, value, colour = compartment)) +
+        geom_line(linewidth = 1) +
+        scale_colour_manual(values = c("S" = "grey", "E" = "orange","I" = "red","R" = "green")) + 
+        xlim(0,60) + ylim(0, 200) +
+        scale_x_continuous(breaks = seq(1, nrow(df), 2)) +
+        theme_minimal() +
+        labs(title = 'SEIR compartments by day of outbreak',
+             subtitle = desc,
+             x = 'day of outbreak',
+             y = 'compartment size')
+
+        # add observed points if they are in the data
+        cols <- df %>% colnames()
+        if ('I_observed' %in% cols) {
+            p <- p + geom_point(data = df, aes(day, I_observed), colour = 'red')
+        }
+    
+    return(p)
+}
+
+# standard SEIR model
+model_SEIR <- function(t, state, parameters){
+  with(as.list(c(state, parameters)),{
+    
+    # Calculate N
+    N <- S + E + I + R
+
+    # Rate of change equations
+    # transmission rate at time t, 
+    dS <- -(beta * S * I) /N
+    dE <- (beta * S * I)/N - (alpha * E)
+    dI <- (alpha * E) - (gamma * I)
+    dR <- gamma * I
+
+    # Combine rates of change into a list
+    return(list(c(dS, dE, dI, dR)))
+  })
+}
+
+# SEIR model with varying beta
+model_SEIR_variable <- function(t, state, parameters){
+  with(as.list(c(state, parameters)),{
+    
+    # Calculate N
+    N <- S + E + I + R
+
+    beta_eff <- beta
+    if (t < 14) beta_eff <- 0.6
+    
+    # Rate of change equations
+    # transmission rate at time t, 
+    dS <- -(beta_eff * S * I) /N
+    dE <- (beta_eff * S * I)/N - (alpha * E)
+    dI <- (alpha * E) - (gamma * I)
+    dR <- gamma * I
+
+    # Combine rates of change into a list
+    return(list(c(dS, dE, dI, dR)))
+  })
+}
+
+```
+
+# Step 1 - Datasets : Exploratory Data Analysis
+
+### Get Hagelloch dataset
+
+```{r get_hagelloch_data}
+
+# load the data from surveillance package
+data("hagelloch")
+df_measles_orig <- hagelloch.df
+remove(hagelloch.df, hagelloch)
+
+# get a subset of variables
+df_measles <- df_measles_orig %>% 
+    select(PN, IFTO, AGE, PRO, tPRO, ERU, tR, GE, CL, x.loc, y.loc) %>% 
+    mutate(days_infected = round(tR - tPRO)) %>% 
+    identity()
+
+# Calculate SI - get symptom start for infecting person
+df_infectingperson <- df_measles %>% select(IFTO = PN, tINFECTING_PRO = tPRO) 
+
+# join onto the main data
+df_measles <- df_measles %>% 
+    left_join(df_infectingperson, by = 'IFTO') %>% 
+    mutate(SI = tPRO - tINFECTING_PRO) %>% 
+    identity()
+```
+
+Basic EDA checks suggest some data cleaning should be considered. Looking at a histogram of the day first symptoms appeared (prodromes), there's a single case which presented significantly later than the penultimte cases preceeding it. We'll drop this case (PN = 141) from the dataset.   
+
+NOTE : *I've used the new dplyr filter_out function to drop this record, you'll need to be sure to use the latest version of the dplyr library.*
+
+```{r eda}
+
+df_measles %>% 
+    ggplot(aes(tPRO)) + 
+    geom_histogram(bins = 30, alpha = 0.4) +
+    theme_minimal() +
+    scale_x_continuous(breaks =  seq(1, nrow(df_measles), 3)) +
+    labs(title = 'Day first symptoms presented',
+         subtitle = 'Showing outlier case',
+         x = 'outbreak day of first symptoms',
+         y = 'number of cases') +
+    geom_point(
+        data = df_measles %>% filter(tPRO > 50),
+        aes(x = tPRO, y = 2),
+        colour = "red",
+        size = 2
+    ) +
+    geom_text(
+        data = df_measles %>% filter(tPRO > 50),
+        aes(x = tPRO, y = 3, label = glue::glue('PN = {PN}')),
+        vjust = -0.5,
+        size = 5
+    )
+
+# you'll need the very latest version of dplyr to use filter_out.
+df_measles <- df_measles %>% filter_out(PN == 141)
+```
+
+### Get England and Wales Measles dataset
+
+```{r measles_govuk_data}
+# Measles Notifications and Deaths 1940-2025
+df_uk_orig <- read_csv('measles-uk.csv') 
+
+# Population data from ONS
+df_pop <- tibble(Year = c(1940, 1941, 1951, 1961, 1971, 1981, 1991, 2001, 2011, 2021, 2023),
+                 Population = c(41.75, 41.75, 43.82, 46.20, 49.15, 49.63, 51.10, 52.21, 56.08, 59.60, 61.10))
+
+# calculate a rolling average, and population percentages
+df_uk <- df_uk_orig %>% 
+    mutate(rolling4 = (lag(Notifications, n=1) + 
+               lag(Notifications, n=2) + 
+               lag(Notifications, n=3) +
+               lag(Notifications, n=4)) / 4) %>% 
+    left_join(df_pop, by='Year') %>% 
+    fill(Population) %>% 
+    mutate(under15_calc = Population * 1000000 * .18) %>% 
+    mutate(measles_prop = Notifications / under15_calc * 100) %>%
+    mutate(deceased_pcent = `Total deaths` / Notifications * 100) %>% 
+    identity() 
+
+```
+
+```{r data_schema_measles}
+
+tibble(
+    Variable = names(df_measles),
+    datatype = map_chr(df_measles, ~ paste(class(.x), collapse = ", ")),
+    count_unique = map_int(df_measles, ~ n_distinct(.x, na.rm = TRUE)),
+    count_na = map_int(df_measles, ~ sum(is.na(.x)))
+    ) %>% 
+    left_join(fn_load_descriptions(), by = 'Variable') %>% 
+    mutate(order = row_number()) %>% 
+    select(Variable, description, order, everything()) %>% 
+    gt() %>% 
+    opt_vertical_padding(scale = 0) %>% 
+    tab_header(title = 'Schema for Hagelloch dataset',
+               subtitle = 'Infected Individuals') %>%
+    identity()
+```
+
+```{r data_schema_uk}
+tibble(
+    Variable = names(df_uk),
+    datatype = map_chr(df_uk, ~ paste(class(.x), collapse = ", ")),
+    count_unique = map_int(df_uk, ~ n_distinct(.x, na.rm = TRUE)),
+    count_na = map_int(df_uk, ~ sum(is.na(.x)))
+    ) %>% 
+    mutate(order = row_number()) %>% 
+    select(Variable, order, everything()) %>% 
+    gt() %>% 
+    opt_vertical_padding(scale = 0) %>% 
+    tab_header(title = 'Schema for England and Wales Measles dataset',
+               subtitle = '1940 - 2025') %>%
+    identity()
+
+```
+
+# Step 2 - Create day based dataset
+
+Create a tibble where each record is the day of the outbreak, so later we can calculate totals for the SEIR compartments on each day. Although the exposure date for each individual is unknown, from our existing knowledge of measles assume this is average 10 days before first symptoms appear.
+
+```{r dates}
+# first symptom date
+date_start <-  min(df_measles$PRO)
+# final rash start date
+date_final <- max(df_measles$ERU)
+
+# assume exposure (average) 10 day before symptoms
+# allow 5 days after last rash appears for charts to fade out
+days_fade_in <- 11
+days_fade_out <- 5
+df_dates <- 
+        # days before the first symptoms, so Exposed compartment is in this time period
+        tibble(date = seq(as.Date(date_start - days_fade_in), as.Date(date_start - 1), by='day')) %>% 
+        # days from first symptoms to final rash appearing, so Infectious compartment is in this period
+        bind_rows(tibble(date = seq(as.Date(date_start), as.Date(date_final), by='day'))) %>% 
+        # days after last rash appears, so all Infections will move into Recovered compartment during this time 
+        bind_rows(tibble(date = seq(as.Date(date_final + 1), as.Date(date_final + days_fade_out), by='day'))) %>%
+        # make a day number where first symptoms are on day 1 
+        mutate(day = row_number() - days_fade_in)
+
+message(paste0('... first symptom ',date_start,' (day 1), final rash started ', date_final))
+```
+
+# Step 3 - Create SEIR data from the dataset 
+
+The dataset records the day the first symptoms appreared and the day of recovery for each individual. We are assuming measles takes 10 days from exposure to first symptoms - and therefore we can calculate the SEIR figures for each day of the outbreak.
+
+```{r create_SEIR_from_data}
+
+df_dates <- df_dates %>% filter(day > 0)
+df_SEIR <- fn_calc_SEIR(df_measles, df_dates, 197)
+
+df_SEIR <- df_SEIR %>% 
+    # first derivative of the rate of change of E
+    mutate(first_derivative = (E - lag(E)) / (day - lag(day))) %>% 
+    mutate(first_derivative = round(first_derivative, 2)) %>% 
+    # second derivative of the rate of change of I
+    mutate(second_derivative = first_derivative - lag(first_derivative)) %>% 
+    mutate(second_derivative = round(second_derivative, 2)) %>% 
+    identity()
+
+p_SEIR <- fn_plot_SEIR(df_SEIR, ' ') + 
+    labs(title = 'SEIR compartments by day of outbreak')
+
+p_SEIR
+
+```
+
+# Step 4 - Exposure and Infection prevalance.
+
+Plot the size of the I compartment over time, overlay assumed E compartment.   
+Illustrate the associated acceleration of the transmission rate (second derivative of E).   
+
+```{r plot_outbreak}
+df_cases <- df_dates %>% 
+    left_join(
+        df_measles %>% 
+        mutate(tI = round(tPRO) - 10) %>% 
+        count(tI) %>% 
+        setNames(c('day', 'exposure')) %>% 
+        identity(), by='day'
+    ) %>% 
+    left_join(
+        df_SEIR %>%
+        select(day, I, first_derivative, second_derivative) %>% 
+        # useful dummy endpoint
+        identity(), by='day'
+    ) %>% 
+    replace(is.na(.), 0) %>% 
+    identity()
+
+p_cases <- ggplot(df_cases, aes(day, I)) +
+            geom_point(color = 'red') +
+            geom_col(aes(day, exposure), alpha = 0.2, fill = 'orange', show.legend = FALSE) +
+            theme_minimal() +
+            theme(
+                axis.text.x = element_blank(),
+                axis.title.x = element_blank(),
+                panel.grid = element_blank()
+            ) +
+            labs(title = "Infection prevalence of Measles outbreak in Hagelloch", 
+                 subtitle = "
+                Red points = Infection prevalance, 
+                Orange bars - Daily count of first symptoms, 
+                Blue line - Acceleration of transmission rate",
+                 y = 'Infected Individuals',
+                 x = NULL) 
+
+divider <- ggplot() +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = 'grey') +
+  theme_void()
+
+p_acceleration <- ggplot(df_cases, aes(day, second_derivative)) +
+                geom_line(color = "blue", linewidth = 0.8, alpha = 0.5) +
+                theme_minimal() +
+                labs(y = "d2E/dt2", x = "Day") +
+                scale_x_continuous(breaks = seq(1, nrow(df_cases), 2)) +
+                theme(panel.grid = element_blank())
+
+(p_cases / divider / p_acceleration) + plot_layout(heights = c(4, 0.1, 0.8))
+```
+
+# Step 5 - SEIR model of outbreak
+
+### 5.1 What we know from the literature 
+
+From published literature the reported number of inhabitants in the village at the time of the outbreak was 577, with 197 children under the age of 15. 
+
+There were 12 children who didn't get measles, reportedly because    
+- 1 child had previous measles (immune)   
+- 3 siblings were kept isolated   
+- 7 infants (<6 months) — likely protected by maternal antibodies   
+- 1 child (~2 years old) — unclear reason   
+
+There's a discrepancy in numbers here, with 188 infections in the dataset, and 12 reported non-infections the total children should be 200 rather than 197. We'll remove the 7 infants and 1 immune from the Susceptible compartment and use 192 for the value of N in a deterministic model. Although there are some Deaths in the population, as Measles confers lasting immunity we'll assume those individuals are part of the Recovered compartment.
+
+From the provided dataset we know 109 individuals recovered from the first wave, and 78 from the second.
+
+### 5.2 Compartment equations 
+
+$\Delta S = -\frac{\beta S I}{N}$    
+$\Delta E = \frac{\beta S I}{N} - \alpha E$    
+$\Delta I = \alpha E - \gamma I$   
+$\Delta R = \gamma I$   
+
+Where -    
+$\beta$ = transmission rate, may be different for Wave 1 and Wave 2 depending on social contacts   
+$\alpha$ = incubation rate (1/number of days exposed)    
+$\gamma$ = removal rate (1/number of days infectious)     
+
+### 5.3 Compartment parameters
+
+$\alpha$ = incubation : we know who infected who and their symptom onset date, we can calculate SI (serial interval)     
+$\gamma$ = removal : we have symptom start day and recovery day we can estimate days infected from data   
+
+```{r eda_populationstats}
+
+# look at some summary stats for (assumed) Wave1 and Wave2
+df_stats <- df_measles %>%
+    mutate(wave = case_when(GE == 1 ~ 'Wave 1', GE == 2 ~ 'Wave 2')) %>% 
+    group_by(wave) %>%
+    summarise(total = n(),
+              mean_SI = round(mean(SI, na.rm = TRUE), 1),
+              mean_Infected_days = round(mean(days_infected), 1),
+              infected_on_day1 = sum(tPRO <= 1),
+              infected_on_day9 = sum(tPRO <= 9),
+              mean_age = round(mean(AGE), 1),
+              pcent_preschool = sum(CL == 'preschool', na.rm = TRUE) / n() * 100,
+              pcent_class1 = sum(CL == '1st class', na.rm = TRUE) / n() * 100, 
+              pcent_class2 = sum(CL == '2nd class', na.rm = TRUE) / n() * 100
+              ) %>% 
+    ungroup() %>% 
+    pivot_longer(
+        cols = -wave,
+        names_to = "description",
+        values_to = "value"
+    ) %>%
+    mutate(description = recode(description, 'total' = 'Total sample')) %>% 
+    pivot_wider(
+        names_from = wave,
+        values_from = value
+    ) %>% 
+    setNames(c('description', 'wave_1', 'wave_2')) %>% 
+    identity()
+
+df_stats %>% gt() %>% 
+    tab_header(title = 'Population Statistics for Wave 1 and 2 of Hagelloch Measles Outbreak',
+               subtitle = 'Infected Individuals only') %>% 
+    fmt_number(columns = c(wave_1, wave_2), decimals = 1) %>% 
+    opt_vertical_padding(scale = 0)
+```
+
+**N** : from the literature as 192 Susceptible individuals   
+**E** : on day 9 there are 4 infected individuals, assume Exposed but not yet symptomatic on day 1 (ie Latent)   
+**I** : on day 1 of the outbreak there is 1 Infected individual   
+**R** : zero at  the start of the outbreak   
+
+```{r run_SEIR_static}
+
+# model from day 1 of the outbreak
+df_cases_model <- df_cases %>% filter(day > 0)
+
+# get timestep of days as vector
+model_timesteps <- df_cases_model %>% pull(day) %>% as.integer()
+
+# Initial values
+N <- 192 # we are told this in the literature
+I0 <- df_cases %>% slice(1) %>% pull(I) # Infected on day 1
+E0 <- 4 # make an assumption about the number Exposed on day 1
+
+# parameters
+params <- c(beta = 2, alpha = 1/10, gamma = 1/7)
+inits <- c(S = N-I0, E = E0, I = I0, R = 0)
+
+# Use ode() to solve with standard model
+model1 <- ode(y = inits,
+            times = model_timesteps,
+            func = model_SEIR,
+            parms = params)
+df_model1 <- as_tibble(model1) 
+
+df_plot <- df_cases_model %>% select(day, I_observed = I) %>% 
+    left_join(df_model1 %>% 
+              mutate(time = as.double(time)) %>% 
+              select(day = time, S, E, I, R) , by = 'day') %>% 
+    identity()
+
+R0 <- params[1] / params[3]
+p <- fn_plot_SEIR(df_plot, 'Static value of beta') +
+    labs(title = "Modelling results")
+p
+
+```
+
+An SEIR model assumes a constant contact rate in the population. Applying this model to the dataset quickly exhausts the S compartment, and does not result in an accurate representation of the outbreak.    
+
+**Conclusion** : As our understanding of parameters gamma and alpha can be assumed to be reliable, dervived as they are from the data and established prior knowledge, the conclusion is that beta must be variable over time in this outbreak. The variability is shown in the second derivative of the Infection curve from the actual data shown in a previous chart.
+
+```{r run_SEIR_variable}
+# Use ode() to solve with model where beta varies
+model2 <- ode(y = inits,
+            times = model_timesteps,
+            func = model_SEIR_variable,
+            parms = params)
+df_model2 <- as_tibble(model2) 
+
+df_plot <- df_cases_model %>% select(day, I_observed = I) %>% 
+    left_join(df_model2 %>% 
+              mutate(time = as.double(time)) %>% 
+              select(day = time, S, E, I, R) , by = 'day') %>% 
+    identity()
+
+R0 <- params[1] / params[3]
+p <- fn_plot_SEIR(df_plot, 'Variable value of beta') +
+    labs(title = "Modelling results")
+p
+```
+
+### SEIR datasets for each wave
+
+```{r plot_SEIR_waves}
+
+df_SEIR1 <- fn_calc_SEIR((df_measles %>% filter(GE == 1)), df_dates, 197)
+df_SEIR2 <- fn_calc_SEIR((df_measles %>% filter(GE == 2)), df_dates, 97)
+
+p_SEIR1 <- fn_plot_SEIR(df_SEIR1, 'Individuals in Wave 1')
+p_SEIR2 <- fn_plot_SEIR(df_SEIR2, 'Individuals in Wave 2')
+
+p_SEIR1 / p_SEIR2 + plot_annotation(title='SEIR compartments derived from data for each wave')
+
+```
+
+# Step 6 - Estimate R with EpiEstim package
+
+We can use the EpiEstim package to estimate R for the Hagelloch outbreak. Given gamma is constant, any change in R must reflect change in beta.
+
+```{r calculateR}
+
+SI_mean <- round(mean(df_measles$SI, na.rm = TRUE))
+SI_std <- round(sd(df_measles$SI, na.rm = TRUE))
+
+# Estimate R using parametric serial interval
+res <- estimate_R(incid = df_cases %>% select(dates = date, I), 
+                  method = "parametric_si", 
+                  config = make_config(list(
+                    mean_si = 10, 
+                    std_si = 2
+                  )))
+
+# Plot the results
+plot(res)
+
+```
+
+**Conclusion** : We can see that R changes over the course of a month. By 1st of Dec R is falling below a value of 1 and petering out, as the second wave of Infection is just beginning to rise.
+
+# Step 7 - Contact Tracing Network
+
+```{r superspreader}
+
+df_measles %>% 
+    count(IFTO) %>% 
+    arrange(desc(n)) %>% 
+    left_join(df_measles %>% select(IFTO = PN, PRO, tPRO), by='IFTO') %>% 
+    mutate(tPRO = round(tPRO)) %>% 
+    setNames(c('Source Individual','Number Infected','Date First Symptoms','Day First Symptoms')) %>% 
+    slice(1:6) %>% 
+    gt() %>% 
+    tab_header(title = 'Contact Network',
+               subtitle = 'Highest secondary infections') %>% 
+    opt_vertical_padding(scale = 0)
+
+df_measles_orig %>% 
+    filter(PN == 45) 
+
+```
+
+A few Individuals infect many others, so the rate of infection is not constant.
+
+# Step 8 - Measles in the UK 1940-2025
+
+```{r measles_uk}
+
+# Chart Notifications and Deaths over time
+xticks <- seq(min(df_uk$Year), max(df_uk$Year), by = 5)
+line_colours <- c("Notifications" = "dodgerblue", "Deaths" = "red", "Rolling 4Y Average" = "black")
+
+yticks <- seq(min(df_uk$Notifications), max(df_uk$Notifications), by = 50000)
+p1 <- df_uk %>%
+    ggplot(aes(x = Year)) +
+    geom_line(aes(y = Notifications, colour = "Notifications")) +
+    geom_line(aes(y = rolling4, colour = 'Rolling 4Y Average')) +
+    scale_colour_manual(name = '', values = line_colours) +
+    scale_x_continuous(breaks = xticks) +
+    scale_y_continuous(breaks = yticks) +
+    theme_minimal() +
+    theme(
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank()
+    ) +
+    geom_vline(xintercept = 1968, linewidth = 0.8, linetype = 2, colour = 'red4') +
+    labs(title = "Measles Notifications and Deaths in England and Wales : 1940 to 2025",
+         subtitle = 'Source - gov.uk') +
+    annotate("text", x = 1969, y = 700000, hjust = 0,
+             label = "Measles vaccine introduced", colour = 'red4')
+
+divider <- ggplot() +
+  geom_hline(yintercept = 0, linewidth = 0.3, colour = 'grey') +
+  theme_void()
+
+yticks <- seq(min(df_uk$`Total deaths`), max(df_uk$`Total deaths`), by = 300)
+p2 <- df_uk %>%
+    ggplot(aes(x = Year)) +
+    geom_line(aes(y = `Total deaths`, colour = "Deaths")) +
+    scale_colour_manual(name = '', values = line_colours) +
+    scale_x_continuous(breaks = xticks) +
+    scale_y_continuous(breaks = yticks) +
+    theme_minimal() +
+    geom_vline(xintercept = 1968, linewidth = 0.8, linetype = 2, colour = 'red4')
+
+p1 / divider / p2 + plot_layout(heights = c(4, 0.1, 0.8)) 
+```
+
+We can see how the introduction of the Measles vaccine in 1968 dramatically affected the prevalence of Measles.
+
+# Step 9 - Animate the geographical spread of the Hagelloch outbreak 
+
+```{r create_animation_dataset}
+# location. As a family shares the same location, add some noise so they show as clusters
+jitter <- 4
+df_animate_location <- df_measles %>% 
+    # each x,y location has multiple people, create small clusters
+    select(PN, x.loc, y.loc) %>% 
+    mutate(x.locjit = x.loc + rnorm(n(), 0, jitter)) %>% 
+    mutate(y.locjit = y.loc + rnorm(n(), 0, jitter)) %>% 
+    identity()
+
+# days when an individual moves compartments
+df_compartment_days <- df_measles %>% 
+    mutate(day_I = round(tPRO)) %>% 
+    mutate(day_R = round(tR) + 1) %>% 
+    mutate(day_E = day_I - 10) %>% 
+    select(PN, day_E, day_I, day_R )
+
+# make a df of compartment each day for each individual 
+df_animate <- 
+    cross_join(df_dates, df_compartment_days) %>% 
+    arrange(PN) %>% 
+    mutate(compartment = case_when(day < day_E ~ 'S',
+                                day < day_I ~ 'E',
+                                day < day_R ~ 'I',
+                                day >= day_R ~ 'R')) %>%  
+    # make compartment a factor to get the order correct
+    mutate(compartment = factor(compartment, levels=c('S','E','I','R'))) %>% 
+    group_by(PN, compartment) %>% 
+        mutate(days_in_compartment = row_number()) %>% 
+    ungroup() %>% 
+    mutate(days_in_compartment = case_when(compartment == 'S' ~ 2,
+                                           compartment == 'R' ~ 2,
+                                           T ~ days_in_compartment)) %>% 
+    left_join(df_animate_location, by = 'PN') %>% 
+    identity()
+```
+
+```{r animate}
+count_days <- nrow(df_dates)
+compartment_colour <- c(S = "darkseagreen1", E = "orange", I = "red", R = "grey")
+
+# test how each slide looks
+# for (i in 11:14) {
+#     p <- df_animate %>% 
+#         filter(day == i) %>% 
+#         ggplot(aes(x.locjit, y.locjit, colour = compartment, group=day)) +
+#         geom_point(aes(size = days_in_compartment)) +
+#         scale_colour_manual(values = compartment_colour) +
+#         theme_minimal() + 
+#         labs(title = paste('Slide ', i),
+#         subtitle = 'Map of Hagelloch',
+#         x = 'x', 
+#         y = 'y') +
+#         theme(legend.position = 'none') 
+#     print(p)
+# }
+
+p <- df_animate %>% 
+    ggplot(aes(x.locjit, y.locjit, colour = compartment, group=day)) +
+    geom_point(aes(size = days_in_compartment)) +
+    scale_colour_manual(values = compartment_colour) +
+    labs(title = 'Day: {frame_time} / {count_days}',
+        subtitle = 'Map of Hagelloch',
+        x = 'x', 
+        y = 'y') +
+    theme_minimal() +
+    theme(legend.position = 'none') +
+    transition_time(day) +
+    ease_aes('linear')
+
+gganimate::animate(p, fps = 10, nframes = count_days * 10, renderer = gifski_renderer())
+```
