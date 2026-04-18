@@ -246,7 +246,7 @@ for (d in days) {
 # stick them together into a gif
 message(glue::glue(' ... Creating gif'))
 png_files <- list.files("png", pattern = "png$", full.names = TRUE)
-img <- magick::image_read(png_files) %>% magick::image_animate(fps = 0.5)
+img <- magick::image_read(png_files) %>% magick::image_animate(fps = 1)
 magick::image_write(img, "outbreak_animation.gif")
 
 ```
