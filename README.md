@@ -11,3 +11,5 @@ Below an animation (built in R) showing the evolution of the disease both geogra
 ![Geographical Spread](outbreak_animation.gif)
 
 The animation shows why Measles is such a difficult disease to manage. The long incubation period (~10 days) and high transmissability mean that there are likely many infections in the population before the first case appears.
+
+![Course Submission](Infectious Disease Modelling - Assignment 2 - Fox.pdf)
