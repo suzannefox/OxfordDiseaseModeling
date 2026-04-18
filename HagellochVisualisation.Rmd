@@ -22,22 +22,23 @@ library(gganimate)
 
 # Get Hagelloch dataset
 ```{r get_hagelloch_data}
-# image
+# image for the visualisation
 png_town <- png::readPNG('Hagelloch.png')
 
 # load the data from surveillance package
 data("hagelloch")
 df_measles_orig <- hagelloch.df
-remove(hagelloch.df, hagelloch)
 
 # get a subset of variables
 df_measles <- df_measles_orig %>% 
     # drop a very late case 
     filter_out(PN == 141) %>%
     # useful variables 
-    select(PN, IFTO, AGE, PRO, tPRO, ERU, tR, SI, GE, CL, x.loc, y.loc) %>% 
+    select(PN, IFTO, AGE, PRO, tPRO, ERU, tR, SI, GE, CL, DEAD, x.loc, y.loc) %>% 
     mutate(days_infected = round(tR - tPRO)) %>% 
     identity()
+
+remove(hagelloch.df, hagelloch, df_measles_orig)
 
 ```
 
@@ -60,12 +61,15 @@ df_dates <-
         # days after last rash appears, so all Infections will move into Recovered compartment during this time 
         bind_rows(tibble(date = seq(as.Date(date_final + 1), as.Date(date_final + days_fade_out), by='day'))) %>%
         # make a day number where first symptoms are on day 1 
-        mutate(day = row_number() - days_fade_in)
+        mutate(day_outbreak = row_number() - days_fade_in) %>% 
+        mutate(day_plot = day_outbreak + days_fade_in) %>% 
+        identity()
 
 message(paste0('... first symptom ',date_start,' (day 1), final rash started ', date_final))
+remove(days_fade_out, date_start, date_final)
 
 # location. As a family shares the same location, add some noise so they show as clusters
-jitter <- 3
+jitter <- 4
 df_animate_location <- df_measles %>% 
     # each x, y location has multiple people, create small clusters
     select(PN, x.loc, y.loc) %>% 
@@ -73,25 +77,30 @@ df_animate_location <- df_measles %>%
     mutate(y.locjit = y.loc + rnorm(n(), 0, jitter)) %>% 
     identity()
 
-# days when an individual moves compartments
+# day of the outbreak some individuals died
+df_animate_died <- df_measles %>% 
+    select(PN, DEAD) %>% 
+    left_join(df_dates, by=c('DEAD' = 'date')) %>% 
+    mutate(day = coalesce(day_outbreak, 0)) %>% 
+    select(PN, died = day_plot)
+
+# day of the outbreak when an individual moves compartments
 df_compartment_days <- df_measles %>% 
     mutate(day_I = round(tPRO)) %>% 
     mutate(day_R = round(tR) + 1) %>% 
     mutate(day_E = day_I - 10) %>% 
     select(PN, day_E, day_I, day_R )
 
-# make a df of compartment each day for each individual 
+# make a df of compartment each outbreak day for each individual 
 df_animate <- 
     cross_join(df_dates, df_compartment_days) %>% 
     arrange(PN) %>% 
-    mutate(compartment = case_when(day < day_E ~ 'S',
-                                day < day_I ~ 'E',
-                                day < day_R ~ 'I',
-                                day >= day_R ~ 'R')) %>%  
+    mutate(compartment = case_when(day_outbreak < day_E ~ 'S',
+                                day_outbreak < day_I ~ 'E',
+                                day_outbreak < day_R ~ 'I',
+                                day_outbreak >= day_R ~ 'R')) %>%  
     # make compartment a factor to get the order correct
     mutate(compartment = factor(compartment, levels=c('S','E','I','R'))) %>% 
-    # we want days to start at 1 for the animation frames
-    mutate(day = day + 11) %>% 
     group_by(PN, compartment) %>% 
         mutate(days_in_compartment = case_when(compartment == 'S' ~ 2,
                                                compartment == 'R' ~ 3,
@@ -99,25 +108,40 @@ df_animate <-
                                                compartment == 'I' ~ 11 - row_number())) %>% 
     ungroup() %>% 
     left_join(df_animate_location, by = 'PN') %>% 
+    left_join(df_animate_died, by = 'PN') %>% 
     identity()
 
-```
-
-```{r settings}
-count_days <- nrow(df_dates)
-compartment_colour <- c(S = "green3", E = "orange", I = "red", R = "grey", X = 'white')
-
+remove(df_animate_location, df_animate_died)
 ```
 
 # generate a frame for each day and stitch together into a gif
 ```{r plot_functions}
 
+count_days <- max(df_animate$day_plot)
+compartment_colour <- c(S = "green3", E = "orange", I = "red", R = "grey", X = 'white')
+
 plot_1 <- function(df_plot, plot_day, background_img) {
+
+    # give some brief narration
+    current_I <- df_plot %>% filter(day_plot == plot_day, compartment == 'I') %>% nrow()
+    current_E <- df_plot %>% filter(day_plot == plot_day, compartment == 'E') %>% nrow()
+    current_D <- df_plot %>% filter(!is.na(died), day_plot == plot_day, died <= plot_day) %>% nrow()
+    first_mortality <- min(df_plot$died, na.rm = TRUE)
+
+    info_text <- glue::glue('Day: {plot_day - days_fade_in} of {count_days - days_fade_in}')
+    if (plot_day <= days_fade_in) {
+        info_text <- glue::glue('Day: {plot_day - days_fade_in} : Infection is building before symptoms appear, exposed = {current_E}')
+    } else if (plot_day >= 11 & plot_day < first_mortality) {
+        info_text <- glue::glue('{info_text} : Symptoms appear, exposed = {current_E}, infected = {current_I}')
+    } else if (plot_day >= first_mortality) {
+        info_text <- glue::glue('{info_text} : exposed = {current_E}, infected = {current_I}, died = {current_D}')
+    }
+
+    # geographical plot
     p1 <- df_plot %>% 
-        filter(day == plot_day) %>% 
+        filter(day_plot == plot_day) %>% 
         ggplot(aes(x.locjit, y.locjit, 
                colour = compartment, 
-               group = day, 
                size = days_in_compartment,
                alpha = 0.3)) +
 
@@ -130,12 +154,20 @@ plot_1 <- function(df_plot, plot_day, background_img) {
         ) +
 
         geom_point() +
+
+        # show deaths
+        geom_text(
+            data = df_plot %>% filter(died > 0 & died <= plot_day),
+            aes(label = "⚠️"),
+            size = 8
+        ) +
+
         # setting : colours come from the factor levels
         scale_colour_manual(values = compartment_colour) +
         # setting : size come from the data, not automatic aes rescaling
         scale_size_identity() +
         labs(title = 'Visualising the Hagelloch Measles outbreak of 1861',
-            subtitle = glue::glue('Day: {plot_day} of {count_days}'),
+            subtitle = glue::glue('{info_text}'),
             x = 'x', 
             y = 'y') +
         theme_minimal() +
@@ -147,14 +179,16 @@ plot_1 <- function(df_plot, plot_day, background_img) {
         theme(legend.position = 'none')
 }
 
+# plot of compartment growth
 plot_2 <- function(df_plot, plot_day) {
+
     p2 <- df_plot %>% 
-            count(day, compartment) %>% 
+            count(day_plot, compartment) %>% 
             # we need all the days to make the x axis static
             # but points ahead of this day need to be invisible
-            mutate(compartment = if_else(day <= plot_day, compartment, 'X')) %>% 
+            mutate(compartment = if_else(day_plot <= plot_day, compartment, 'X')) %>% 
             mutate(compartment = factor(compartment, levels=c('S','E','I','R','X'))) %>% 
-            ggplot(aes(day, n, colour = compartment, group = day)) +
+            ggplot(aes(day_plot, n, colour = compartment)) +
             geom_point() +
             scale_colour_manual(values = compartment_colour) +
             theme_minimal() +
@@ -167,6 +201,7 @@ plot_2 <- function(df_plot, plot_day) {
             theme(legend.position = 'none')
 }
 
+# we need a single horizontal line to divide the plots
 plot_divider <- function() {
     divider <- ggplot() + 
                geom_hline(yintercept = 0, linewidth = 0.3, colour = 'grey') +
@@ -175,29 +210,43 @@ plot_divider <- function() {
 
 ```
 
+```{r test_images}
+
+# create images to test specific plot days
+xx <- seq(9,12)
+for (x in xx) {
+    print(x)
+    p1 <- plot_1(df_animate, x, png_town)
+    print(p1)
+}
+```
+
 ```{r create_animation}
-# create a list of days
-days <- sort(unique(df_animate$day))
+
+# create a sequence of the days for each image
+days <- seq(1, count_days)
+# create the divider line plot
 p_divide <- plot_divider()
 
 # create an image for each day
 for (d in days) {  
-  p1 <- plot_1(df_animate, d, png_town)
-  p2 <- plot_2(df_animate, d)
-  p <- (p1 / p_divide / p2) + plot_layout(heights = c(4, 0.1, 0.8))
-  
-  ggsave(
-    filename = glue("png/frame_{sprintf('%03d', d)}.png"),
-    plot = p,
-    width = 8,
-    height = 6,
-    dpi = 150
-  )
+
+    p1 <- plot_1(df_animate, d, png_town)
+    p2 <- plot_2(df_animate, d)
+    p <- (p1 / p_divide / p2) + plot_layout(heights = c(4, 0.1, 0.8))
+    ggsave(filename = glue("png/frame_{sprintf('%03d', d)}.png"), plot = p, width = 8, height = 6, dpi = 150)
+
+    if (d == length(days)) {
+        message(glue::glue(' ... Finished. {d} frames created'))
+    } else if (d %% 10 == 0) {
+        message(glue::glue(' ... {d} frames created'))
+    }
 }
 
 # stick them together into a gif
+message(glue::glue(' ... Creating gif'))
 png_files <- list.files("png", pattern = "png$", full.names = TRUE)
-img <- magick::image_read(png_files) %>% magick::image_animate(fps = 1)
+img <- magick::image_read(png_files) %>% magick::image_animate(fps = 0.5)
 magick::image_write(img, "outbreak_animation.gif")
 
 ```
