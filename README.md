@@ -14,4 +14,4 @@ The animation shows why Measles is such a difficult disease to manage. The long 
 
 Animation code -> [HagellochVisualisation.Rmd](HagellochVisualisation.Rmd)    
 Project Code -> [OutbreaksData.Rmd](OutbreaksData.Rmd)   
-Full report -> [Project Report](<Infectious Disease Modelling - Assignment 2 - Fox.pdf>)
+Project Report -> [Project Report](<Infectious Disease Modelling - Assignment 2 - Fox.pdf>)
